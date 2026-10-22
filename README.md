@@ -16,6 +16,18 @@
 - Preserves default `.xisf` application and FITS associations.
 - Backs up prior per-user thumbnail handler values and provides an uninstall script.
 
+## Download compiled Windows extension
+
+**[Download Windows XISF Thumbnails v0.3.5 (ZIP)](https://github.com/ImixVega/windows-xisf-thumbnails/releases/download/v0.3.5/Windows-XISF-Thumbnails-v0.3.5.zip)** · [Release notes](https://github.com/ImixVega/windows-xisf-thumbnails/releases/tag/v0.3.5)
+
+Extract the ZIP, open **64-bit Windows PowerShell** in the extracted folder, and run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\Install.ps1
+```
+
+**No .NET SDK or compilation needed** for the prebuilt release. If upgrading, first run `Uninstall.ps1` from the existing version; after installation restart Windows to unload the previous COM provider.
+
 ## Requirements
 
 Windows 10/11 x64, Windows PowerShell 5.1, [.NET SDK 8+](https://dotnet.microsoft.com/download) for building, and internet for initial NuGet restore.
