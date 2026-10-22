@@ -2,6 +2,18 @@
 
 Darmowe miniaturki `.xisf` z automatycznym stretchem podobnym do PixInsight STF. Osobne rozszerzenie powłoki Windows; nie zależy od QuickLook i nie zmienia sposobu otwierania plików w PixInsight.
 
+## Pobierz gotową wersję
+
+**[Windows XISF Thumbnails v0.3.5 — pobierz ZIP](https://github.com/ImixVega/windows-xisf-thumbnails/releases/download/v0.3.5/Windows-XISF-Thumbnails-v0.3.5.zip)** · [Opis wydania](https://github.com/ImixVega/windows-xisf-thumbnails/releases/tag/v0.3.5)
+
+Rozpakuj ZIP, otwórz **64-bitowy Windows PowerShell** w rozpakowanym folderze i wykonaj:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\Install.ps1
+```
+
+**Gotowe wydanie nie wymaga .NET SDK ani kompilowania źródeł.** Jeśli masz starszą wersję, najpierw wykonaj jej `Uninstall.ps1`; po zmianie DLL uruchom ponownie cały Windows, aby odświeżyć proces COM Surrogate.
+
 ## Instalacja (Windows 10/11 x64)
 
 1. Zainstaluj darmowy [.NET SDK 8 lub nowszy](https://dotnet.microsoft.com/download). ZSTD jest pobierane przy kompilacji przez NuGet.
