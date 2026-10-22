@@ -1,0 +1,93 @@
+name: Build and publish Thumbnails v0.3.5
+
+on:
+  push:
+    paths:
+      - .github/workflows/release.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Build Windows thumbnail provider
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & .\Build.ps1
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to compile thumbnail provider' }
+
+      - name: Smoke-test COM thumbnail generation
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          .\Test.ps1
+          if (-not (Test-Path '.\TestThumbnail.png')) { throw 'Smoke test did not generate PNG' }
+
+      - name: Package compiled DLLs and install scripts
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $stage = Join-Path $env:RUNNER_TEMP 'windows-xisf-thumbnails-release'
+          $dist = Join-Path $stage 'dist'
+          $tests = Join-Path $stage 'tests'
+          New-Item -ItemType Directory $stage,$dist,$tests -Force | Out-Null
+          Copy-Item 'dist\*.dll' -Destination $dist
+          foreach ($file in @('Install.ps1','Uninstall.ps1','Test.ps1','README.md','README_PL.md','LICENSE.txt','CHANGELOG.md')) {
+            Copy-Item -LiteralPath $file -Destination $stage
+          }
+          Copy-Item 'tests\ThumbnailSmokeTest.cs' -Destination $tests
+          Copy-Item 'tests\test_rgb_zstd.xisf' -Destination $tests
+          $zip = Join-Path $PWD 'Windows-XISF-Thumbnails-v0.3.5.zip'
+          Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip -CompressionLevel Optimal -Force
+          Add-Type -AssemblyName System.IO.Compression
+          $verify = [IO.Compression.ZipFile]::OpenRead($zip)
+          try {
+            $names = @($verify.Entries | ForEach-Object FullName)
+            foreach ($entry in @('Install.ps1','Uninstall.ps1','dist/AstroXisf.ThumbnailProvider.dll','dist/ZstdSharp.dll')) {
+              if ($names -notcontains $entry) { throw "Missing $entry in release archive" }
+            }
+          } finally { $verify.Dispose() }
+
+      - name: Publish compiled provider in GitHub Releases
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $file = Join-Path $PWD 'Windows-XISF-Thumbnails-v0.3.5.zip'
+          $sha = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$sha  Windows-XISF-Thumbnails-v0.3.5.zip" | Set-Content -Path 'SHA256SUMS.txt' -Encoding ascii
+          $notes = @'
+          **Windows XISF Thumbnails v0.3.5 (Windows 10/11 x64)**
+
+          - Explorer thumbnail previews of PixInsight XISF images with automatic STF-like stretch.
+          - Includes ZSTD/zlib/LZ4 support and large Drizzle handling via memory-mapped temporary storage.
+          - Installs for the current user without Administrator privileges. Preserves the default XISF application and FITS associations.
+          - Tested on Windows 10 with actual M42 Drizzle XISF (after rebooting to unload an older COM provider).
+          - Community prototype: clean-install testing on a second PC has not yet been completed.
+
+          **Install**: download and extract `Windows-XISF-Thumbnails-v0.3.5.zip`, right-click inside the extracted folder and open 64-bit PowerShell, then execute:
+
+          ```powershell
+          powershell -ExecutionPolicy Bypass -File .\Install.ps1
+          ```
+
+          **Upgrade**: uninstall an older release first using its `Uninstall.ps1`. Reboot Windows after upgrading to unload any old COM Surrogate DLL, then install the new version. To uninstall this version, run `Uninstall.ps1` from the extracted folder.
+
+          This release ZIP contains the **precompiled** thumbnail DLL and required dependencies; .NET SDK is **not required** to install it.
+          '@
+          $notes | Set-Content -Path 'RELEASE_NOTES.txt' -Encoding utf8
+          gh release create 'v0.3.5' $file 'SHA256SUMS.txt' --target $env:GITHUB_SHA --title 'Windows XISF Thumbnails v0.3.5' --notes-file 'RELEASE_NOTES.txt'
+          if ($LASTEXITCODE -ne 0) { throw 'GitHub Release creation failed' }
