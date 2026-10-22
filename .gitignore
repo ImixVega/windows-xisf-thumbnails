@@ -1,0 +1,21 @@
+# Generated output
+bin/
+obj/
+dist/
+lib/
+.vs/
+*.user
+*.suo
+*.pdb
+*.qlplugin
+TestThumbnail.png
+*.zip
+# Local test output and secrets
+*.log
+*.tmp
+__pycache__/
+*.pyc
+.vscode/
+.idea/
+.env
+.env.*
