@@ -11,6 +11,7 @@
 - Native Explorer thumbnails using `IThumbnailProvider` / `IInitializeWithStream`.
 - AutoSTF-like median/MAD stretching of XISF mono and RGB images, with common Bayer patterns.
 - Support for XISF `zstd`, `zstd+sh`, `zlib`, `lz4`, `lz4hc` and subblocks.
+- **v0.3.5:** Preview large Drizzle images (up to 12 GiB decoded) with a memory-mapped backing store and streaming ZSTD/zlib decompression. Requires free TEMP disk space; large LZ4 blocks remain limited.
 - Per-user COM registration (HKCU); **no Administrator privileges** required.
 - Preserves default `.xisf` application and FITS associations.
 - Backs up prior per-user thumbnail handler values and provides an uninstall script.
@@ -35,7 +36,7 @@ Test output: `TestThumbnail.png`. To test with your own sample:
 powershell -ExecutionPolicy Bypass -File .\Test.ps1 -XisfFile "D:\Astro\example.xisf"
 ```
 
-Open Explorer → **Large icons / Extra large icons**; if needed, restart Windows Explorer and test a copied `.xisf` under a new filename to avoid a stale thumbnail cache.
+Open Explorer → **Large icons / Extra large icons**. **When upgrading from v0.3.4 or earlier, reboot Windows** to release the old COM DLL from Shell Surrogate; otherwise Explorer may still show an old decoder error. If thumbnails are cached, try a copy of the `.xisf` under a new filename.
 
 The installer registers the thumbnail provider for `.xisf`, `SystemFileAssociations`, and the active ProgID(s) — including PixInsight's association — **without modifying the default program**. This integrates the successful v0.3.4 registration repair into a fresh install.
 
@@ -51,7 +52,7 @@ Logs (only on decoder failures): `%LOCALAPPDATA%\AstroXisfThumbnail\errors.log`.
 
 ## Status / limitations
 
-Windows 10 user testing confirmed: code v0.3.1 builds, generates PNG with `Test.ps1` v0.3.3, and works in Explorer after applying registration fix v0.3.4. This consolidated v0.3.4 installer contains the same fixes but **has not yet been separately validated end-to-end**. Windows shell extensions should be evaluated carefully on the user's own machine; managed in-process extensions are not Microsoft's recommended production architecture.
+Windows 10 user testing confirmed v0.3.5 compiled and produced a thumbnail for a real large M42 Drizzle XISF; after reboot, Explorer displayed that thumbnail. A clean-machine install has not yet been tested. Windows shell extensions should be evaluated carefully on the user's own machine; managed in-process extensions are not Microsoft's recommended production architecture.
 
 Only the first 2D XISF image is previewed. Not all unusual XISF variants are supported; the stretch is similar to, not identical to, PixInsight STF.
 

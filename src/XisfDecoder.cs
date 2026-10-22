@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.IO.Compression;
+using System.IO.MemoryMappedFiles;
 using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -27,7 +28,8 @@ namespace QuickLook.Plugin.XisfViewer
     public static class XisfDecoder
     {
         private const int MaximumHeaderBytes = 32 * 1024 * 1024;
-        private const long MaximumPixelBytes = 1000L * 1024L * 1024L;
+        private const long MaximumPixelBytes = 1000L * 1024L * 1024L; // normal in-memory path
+        private const long MaximumDiskPixelBytes = 12L * 1024L * 1024L * 1024L; // out-of-core hard cap
 
         // QuickLook can call Preview(path); Explorer provides only an IStream.
         // The shared decoder therefore supports both a filename and a seekable stream.
@@ -68,11 +70,10 @@ namespace QuickLook.Plugin.XisfViewer
                 int sampleSize = BytesPerSample(format);
                 long pixels = checked((long)width * height);
                 long size = checked(pixels * channels * sampleSize);
-                if (size > MaximumPixelBytes) throw new NotSupportedException("Obraz za duży dla wersji testowej");
+                if (size > MaximumDiskPixelBytes) throw new NotSupportedException("Obraz ma ponad 12 GiB po rozpakowaniu. Limit bezpieczeństwa wersji testowej.");
                 cancel.ThrowIfCancellationRequested();
 
                 string compression = (string)image.Attribute("compression") ?? "";
-                var raw = ReadImageBlock(fs, image, size, cancel);
                 bool bigEndian = string.Equals((string)image.Attribute("byteOrder"), "big", StringComparison.OrdinalIgnoreCase);
                 bool normal = string.Equals((string)image.Attribute("pixelStorage"), "normal", StringComparison.OrdinalIgnoreCase);
                 string cfa = image.Descendants().FirstOrDefault(e => e.Name.LocalName == "ColorFilterArray")?.Attribute("pattern")?.Value;
@@ -80,7 +81,23 @@ namespace QuickLook.Plugin.XisfViewer
                 if (cfa != "RGGB" && cfa != "BGGR" && cfa != "GRBG" && cfa != "GBRG") cfa = null;
                 if (channels != 1) cfa = null;
 
+                if (size > MaximumPixelBytes)
+                {
+                    using (var diskData = DiskPixelData.Open(fs, image, size, width, height,
+                        channels, format, sampleSize, bigEndian, normal, cancel))
+                        return RenderPreview(diskData, width, height, channels, format, cfa,
+                            compression, maxEdge, cancel, true);
+                }
+                var raw = ReadImageBlock(fs, image, size, cancel);
                 var imageData = new PixelData(raw, width, height, channels, format, sampleSize, bigEndian, normal);
+                return RenderPreview(imageData, width, height, channels, format, cfa,
+                    compression, maxEdge, cancel, false);
+        }
+
+        private static PreviewImage RenderPreview(ISampleData imageData, int width, int height,
+            int channels, string format, string cfa, string compression, int maxEdge,
+            CancellationToken cancel, bool diskMode)
+        {
                 var stretch = Stretch.Compute(imageData, cancel);
                 double resize = Math.Min(1.0, maxEdge / (double)Math.Max(width, height));
                 int outW = Math.Max(1, (int)Math.Round(width * resize));
@@ -115,11 +132,11 @@ namespace QuickLook.Plugin.XisfViewer
                     Width = outW,
                     Height = outH,
                     Bgr = bgr,
-                    Info = $"XISF  {width} × {height}  |  {format}  |  {(cfa != null ? "CFA " + cfa : channels == 3 ? "RGB" : "MONO")}  |  {(compression.Length == 0 ? "bez kompresji" : compression.Split(':')[0])}  |  AutoSTF (podgląd, plik bez zmian)"
+                    Info = $"XISF  {width} × {height}  |  {format}  |  {(cfa != null ? "CFA " + cfa : channels == 3 ? "RGB" : "MONO")}  |  {(compression.Length == 0 ? "bez kompresji" : compression.Split(':')[0])}  |  AutoSTF (podgląd, plik bez zmian){(diskMode ? " | out-of-core" : "")}"
                 };
         }
 
-        private static double Bayer(PixelData data, int x, int y, string bayer, int target)
+        private static double Bayer(ISampleData data, int x, int y, string bayer, int target)
         {
             int centerColor = BayerAt(x, y, bayer);
             if (centerColor == target) return data.Sample(x, y, 0);
@@ -375,7 +392,295 @@ namespace QuickLook.Plugin.XisfViewer
             [FieldOffset(0)] public double Number;
         }
 
-        private sealed class PixelData
+        private interface ISampleData
+        {
+            int Width { get; }
+            int Height { get; }
+            int Channels { get; }
+            double Sample(int x, int y, int channel);
+        }
+
+        // Large-image path: disk-backed decoded pixel data, never a multi-GiB byte[].
+        // We preserve compressed byte shuffling on disk and undo it when sampling.
+        private sealed class DiskPixelData : ISampleData, IDisposable
+        {
+            private readonly MemoryMappedFile _mapping;
+            private readonly MemoryMappedViewAccessor _view;
+            private readonly string _tempFile;
+            private readonly long _dataOffset, _byteCount, _pixels;
+            private readonly int _channels, _sampleSize, _shuffle;
+            private readonly string _format;
+            private readonly bool _bigEndian, _normal;
+            public int Width { get; private set; }
+            public int Height { get; private set; }
+            public int Channels { get { return _channels; } }
+
+            private DiskPixelData(MemoryMappedFile mmf, string tempFile, long dataOffset,
+                long byteCount, int shuffle, int width, int height, int channels,
+                string format, int sampleSize, bool bigEndian, bool normal)
+            {
+                _mapping = mmf;
+                _view = mmf.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read);
+                _tempFile = tempFile;
+                _dataOffset = dataOffset;
+                _byteCount = byteCount;
+                _shuffle = shuffle;
+                _channels = channels;
+                _sampleSize = sampleSize;
+                _format = format;
+                _bigEndian = bigEndian;
+                _normal = normal;
+                Width = width;
+                Height = height;
+                _pixels = (long)width * height;
+            }
+
+            public static DiskPixelData Open(Stream source, XElement image, long expected,
+                int width, int height, int channels, string format, int sampleSize,
+                bool bigEndian, bool normal, CancellationToken cancel)
+            {
+                var loc = Attribute(image, "location").Split(':');
+                if (loc.Length != 3 || loc[0] != "attachment")
+                    throw new NotSupportedException("Duże obrazy wymagają bloku XISF attachment");
+                long position = long.Parse(loc[1], CultureInfo.InvariantCulture);
+                long inputLength = long.Parse(loc[2], CultureInfo.InvariantCulture);
+                if (position < 16 || inputLength < 1 || position > source.Length - inputLength)
+                    throw new InvalidDataException("Błędny attachment dużego obrazu");
+
+                string compression = (string)image.Attribute("compression") ?? "";
+                bool isCompressed = compression.Length > 0;
+                string codec = "";
+                int shuffle = 1;
+                long declaredLength = expected;
+                if (isCompressed)
+                {
+                    string[] pieces = compression.Split(':');
+                    if (pieces.Length < 2) throw new InvalidDataException("XISF compression bez rozmiaru");
+                    codec = pieces[0].ToLowerInvariant();
+                    if (codec.EndsWith("+sh", StringComparison.Ordinal))
+                    {
+                        if (pieces.Length < 3) throw new InvalidDataException("Brak rozmiaru +sh");
+                        shuffle = PositiveInt(pieces[2]);
+                        if (shuffle != sampleSize) throw new NotSupportedException("Nieznany typ byte shuffle");
+                        codec = codec.Substring(0, codec.Length - 3);
+                    }
+                    declaredLength = long.Parse(pieces[1], CultureInfo.InvariantCulture);
+                    if (declaredLength != expected) throw new InvalidDataException("XISF: zła długość po dekompresji");
+                    if (codec != "zstd" && codec != "zlib" && codec != "lz4" && codec != "lz4hc")
+                        throw new NotSupportedException("Kompresja dużego XISF: " + codec);
+                }
+                else if (inputLength != expected)
+                    throw new InvalidDataException("Niezgodny rozmiar nieskompresowanego obrazu");
+
+                // A real FileStream containing uncompressed XISF can be memory-mapped in-place.
+                // Explorer's IStream is not a FileStream, so it is spooled to a temporary file.
+                if (!isCompressed && source is FileStream)
+                {
+                    var file = (FileStream)source;
+                    var map = MemoryMappedFile.CreateFromFile(file, null, 0,
+                        MemoryMappedFileAccess.Read, HandleInheritability.None, true);
+                    try
+                    {
+                        return new DiskPixelData(map, null, position, expected, 1,
+                            width, height, channels, format, sampleSize, bigEndian, normal);
+                    }
+                    catch { map.Dispose(); throw; }
+                }
+
+                string temporary = Path.Combine(Path.GetTempPath(), "AstroXisf_" + Guid.NewGuid().ToString("N") + ".raw");
+                var drive = new DriveInfo(Path.GetPathRoot(temporary));
+                if (drive.AvailableFreeSpace < expected + 256L * 1024L * 1024L)
+                    throw new IOException("Za mało wolnego miejsca na dysku TEMP dla dużego XISF");
+                try
+                {
+                    source.Position = position;
+                    using (var output = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write,
+                        FileShare.Read, 1024 * 1024, FileOptions.SequentialScan))
+                    {
+                        if (!isCompressed)
+                            CopyExact(source, output, expected, cancel);
+                        else
+                        {
+                            var blocks = new List<Tuple<long, long>>();
+                            string subblocks = (string)image.Attribute("subblocks") ?? "";
+                            if (subblocks.Length != 0)
+                            {
+                                foreach (var pair in subblocks.Split(':'))
+                                {
+                                    var p = pair.Split(',');
+                                    if (p.Length != 2) throw new InvalidDataException("Złe subblocks");
+                                    blocks.Add(Tuple.Create(long.Parse(p[0], CultureInfo.InvariantCulture),
+                                        long.Parse(p[1], CultureInfo.InvariantCulture)));
+                                }
+                            }
+                            else blocks.Add(Tuple.Create(inputLength, expected));
+                            long read = 0, wrote = 0;
+                            foreach (var block in blocks)
+                            {
+                                cancel.ThrowIfCancellationRequested();
+                                long compressedBytes = block.Item1, unpackedBytes = block.Item2;
+                                if (compressedBytes < 1 || unpackedBytes < 1 ||
+                                    compressedBytes > inputLength - read || unpackedBytes > expected - wrote)
+                                    throw new InvalidDataException("Zły zakres subblock XISF");
+                                long currentBlockEnd = position + read + compressedBytes;
+                                source.Position = position + read;
+                                if (compressedBytes == unpackedBytes)
+                                    CopyExact(source, output, unpackedBytes, cancel);
+                                else if (codec == "zstd")
+                                {
+                                    using (var part = new LimitedInputStream(source, compressedBytes))
+                                    using (var unzip = new ZstdSharp.DecompressionStream(part))
+                                    {
+                                        CopyExact(unzip, output, unpackedBytes, cancel);
+                                        if (unzip.ReadByte() != -1)
+                                            throw new InvalidDataException("ZSTD: więcej danych niż zadeklarowano");
+                                    }
+                                }
+                                else if (codec == "zlib")
+                                {
+                                    if (compressedBytes < 6) throw new InvalidDataException("Zlib: za krótki blok");
+                                    int cmf = source.ReadByte();
+                                    int flg = source.ReadByte();
+                                    if ((cmf & 15) != 8 || ((cmf << 8) + flg) % 31 != 0)
+                                        throw new InvalidDataException("Błędny nagłówek zlib");
+                                    using (var part = new LimitedInputStream(source, compressedBytes - 6))
+                                    using (var unzip = new DeflateStream(part, CompressionMode.Decompress))
+                                    {
+                                        CopyExact(unzip, output, unpackedBytes, cancel);
+                                        if (unzip.ReadByte() != -1)
+                                            throw new InvalidDataException("Zlib: więcej danych niż zadeklarowano");
+                                    }
+                                }
+                                else
+                                {
+                                    // Unlike ZSTD and zlib, the legacy LZ4 routine requires a RAM block.
+                                    // Guard it to keep the Explorer shell responsive.
+                                    const int maxLz4Chunk = 128 * 1024 * 1024;
+                                    if (compressedBytes > maxLz4Chunk || unpackedBytes > maxLz4Chunk)
+                                        throw new NotSupportedException("Duży blok LZ4 >128 MiB. Zapisz XISF jako zstd.");
+                                    var compressed = ReadExactly(source, (int)compressedBytes);
+                                    var decoded = new byte[(int)unpackedBytes];
+                                    DecompressLz4(compressed, 0, compressed.Length, decoded, 0, decoded.Length);
+                                    output.Write(decoded, 0, decoded.Length);
+                                }
+                                source.Position = currentBlockEnd;
+                                read += compressedBytes;
+                                wrote += unpackedBytes;
+                            }
+                            if (read != inputLength || wrote != expected)
+                                throw new InvalidDataException("Subblocks: niezgodny rozmiar całkowity");
+                        }
+                        output.Flush();
+                        if (output.Length != expected)
+                            throw new InvalidDataException("XISF: niepoprawna długość danych na dysku");
+                    }
+                    var mapped = MemoryMappedFile.CreateFromFile(temporary, FileMode.Open, null,
+                        0, MemoryMappedFileAccess.Read);
+                    try
+                    {
+                        return new DiskPixelData(mapped, temporary, 0, expected, shuffle,
+                            width, height, channels, format, sampleSize, bigEndian, normal);
+                    }
+                    catch { mapped.Dispose(); throw; }
+                }
+                catch
+                {
+                    try { File.Delete(temporary); } catch { }
+                    throw;
+                }
+            }
+
+            private static void CopyExact(Stream src, Stream dest, long n, CancellationToken cancel)
+            {
+                var buffer = new byte[256 * 1024];
+                while (n > 0)
+                {
+                    cancel.ThrowIfCancellationRequested();
+                    int toRead = (int)Math.Min(buffer.Length, n);
+                    int count = src.Read(buffer, 0, toRead);
+                    if (count <= 0) throw new EndOfStreamException("Ucięty blok XISF");
+                    dest.Write(buffer, 0, count);
+                    n -= count;
+                }
+            }
+
+            private sealed class LimitedInputStream : Stream
+            {
+                private readonly Stream _source;
+                private long _remaining;
+                public LimitedInputStream(Stream source, long length) { _source = source; _remaining = length; }
+                public override int Read(byte[] b, int offset, int count)
+                {
+                    if (_remaining <= 0) return 0;
+                    int read = _source.Read(b, offset, (int)Math.Min(count, _remaining));
+                    _remaining -= read;
+                    return read;
+                }
+                public override bool CanRead { get { return true; } }
+                public override bool CanSeek { get { return false; } }
+                public override bool CanWrite { get { return false; } }
+                public override long Length { get { throw new NotSupportedException(); } }
+                public override long Position { get { throw new NotSupportedException(); } set { throw new NotSupportedException(); } }
+                public override void Flush() { }
+                public override long Seek(long o, SeekOrigin so) { throw new NotSupportedException(); }
+                public override void SetLength(long l) { throw new NotSupportedException(); }
+                public override void Write(byte[] b, int o, int c) { throw new NotSupportedException(); }
+            }
+
+            private byte GetByte(long offset)
+            {
+                if (offset < 0 || offset >= _byteCount) throw new InvalidDataException("Piksel poza plikiem");
+                if (_shuffle > 1)
+                {
+                    long count = _byteCount / _shuffle;
+                    if (offset < count * _shuffle)
+                        offset = (offset % _shuffle) * count + offset / _shuffle;
+                }
+                return _view.ReadByte(_dataOffset + offset);
+            }
+
+            public double Sample(int x, int y, int channel)
+            {
+                long index = (long)y * Width + x;
+                long sample = _normal ? index * _channels + channel : channel * _pixels + index;
+                long pos = checked(sample * _sampleSize);
+                uint u = GetByte(pos);
+                if (_sampleSize >= 2)
+                    u = _bigEndian ? (u << 8) | GetByte(pos + 1) : u | ((uint)GetByte(pos + 1) << 8);
+                if (_sampleSize >= 4)
+                    u = _bigEndian ? (u << 16) | ((uint)GetByte(pos + 2) << 8) | GetByte(pos + 3)
+                        : u | ((uint)GetByte(pos + 2) << 16) | ((uint)GetByte(pos + 3) << 24);
+                switch (_format)
+                {
+                    case "UInt8": return u / 255.0;
+                    case "UInt16": return u / 65535.0;
+                    case "Int16": return (short)u / 32767.0;
+                    case "UInt32": return u / 4294967295.0;
+                    case "Int32": return (int)u / 2147483647.0;
+                    case "Float32": return new FloatBits { Bits = u }.Number;
+                    case "Float64":
+                        ulong bits;
+                        if (_bigEndian)
+                            bits = ((ulong)u << 32) | ((ulong)GetByte(pos + 4) << 24) |
+                                ((ulong)GetByte(pos + 5) << 16) | ((ulong)GetByte(pos + 6) << 8) | GetByte(pos + 7);
+                        else
+                            bits = u | ((ulong)GetByte(pos + 4) << 32) | ((ulong)GetByte(pos + 5) << 40) |
+                                ((ulong)GetByte(pos + 6) << 48) | ((ulong)GetByte(pos + 7) << 56);
+                        return new DoubleBits { Bits = bits }.Number;
+                    default: throw new NotSupportedException("sampleFormat: " + _format);
+                }
+            }
+
+            public void Dispose()
+            {
+                _view.Dispose();
+                _mapping.Dispose();
+                if (_tempFile != null)
+                    try { File.Delete(_tempFile); } catch { }
+            }
+        }
+
+        private sealed class PixelData : ISampleData
         {
             private readonly byte[] _bytes;
             private readonly int _channels, _bytesPerSample;
@@ -453,7 +758,7 @@ namespace QuickLook.Plugin.XisfViewer
                 _midtone = Math.Max(0.001, Math.Min(0.999, midtone));
             }
 
-            public static Stretch Compute(PixelData image, CancellationToken cancel)
+            public static Stretch Compute(ISampleData image, CancellationToken cancel)
             {
                 // Sample at most ~80k pixels, preserving channel balance (linked STF).
                 long count = (long)image.Width * image.Height;

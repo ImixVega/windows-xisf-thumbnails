@@ -4,8 +4,8 @@
     <OutputType>Library</OutputType>
     <AssemblyName>AstroXisf.ThumbnailProvider</AssemblyName>
     <RootNamespace>AstroXisf.ThumbnailProvider</RootNamespace>
-    <Version>0.3.4</Version>
-    <AssemblyVersion>0.3.4.0</AssemblyVersion>
+    <Version>0.3.5</Version>
+    <AssemblyVersion>0.3.5.0</AssemblyVersion>
     <LangVersion>latest</LangVersion>
     <Nullable>disable</Nullable>
     <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>

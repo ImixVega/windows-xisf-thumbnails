@@ -1,4 +1,4 @@
-﻿#Requires -Version 5.1
+#Requires -Version 5.1
 # Installs only .xisf thumbnail associations in HKCU; no administrator privileges needed.
 $ErrorActionPreference = 'Stop'
 if (-not [Environment]::Is64BitProcess -or -not [Environment]::Is64BitOperatingSystem) {
@@ -58,7 +58,7 @@ if (Test-Path $backupFile) {
     throw "Rozszerzenie juz zainstalowane. Odinstaluj je przed aktualizacja: .\Uninstall.ps1"
 }
 New-Item -ItemType Directory -Path $installRoot -Force | Out-Null
-$installFolder = Join-Path $installRoot ('v0.3.4-' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
+$installFolder = Join-Path $installRoot ('v0.3.5-' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
 New-Item -ItemType Directory -Path $installFolder -Force | Out-Null
 # Copy runtime dependencies as well as the COM assembly.
 Get-ChildItem -LiteralPath $source -Filter '*.dll' -File | ForEach-Object {
